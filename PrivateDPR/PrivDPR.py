@@ -1,18 +1,24 @@
 import random
 import math
+import time
 import tensorflow as tf
 import numpy as np
 import argparse
 import networkx as nx
+import sys
 import scipy.sparse as sp
 from utils import graph_util
+# from privacy.analysis.rdp_accountant import compute_rdp
+# from privacy.analysis.rdp_accountant import get_privacy_spent
+# from privacy.optimizers import dp_optimizer
 
+# ---------------------------------------------------
 parser = argparse.ArgumentParser()
 parser.add_argument('--embedding_dim', default=128)  # default
-parser.add_argument('--batch_size', default=16)
-parser.add_argument('--walk_num', default=2)
-parser.add_argument('--walk_len', default=16)
-parser.add_argument('--learning_rate', default=0.001)
+parser.add_argument('--batch_size', default=16)  # from DeepWalk
+parser.add_argument('--walk_num', default=2)  # from DeepWalk
+parser.add_argument('--walk_len', default=16)  # from DeepWalk
+parser.add_argument('--learning_rate', default=0.001)  # from DPGGAN
 parser.add_argument('--n_epochs', default=5)  # default
 parser.add_argument('--n_earlystop', default=2)  # done
 parser.add_argument('--tau', default=0.5)  # default
@@ -22,11 +28,12 @@ parser.add_argument('--delta', default=0.00001)  # default
 parser.add_argument('--is_GradientClip', default=True)
 parser.add_argument('--layer_num', default=1)
 parser.add_argument('--epsilon', default=0.1)
-parser.add_argument('--hidden_layer_dim', default=64)
-parser.add_argument('--g_clip', default=5)
+parser.add_argument('--hidden_layer_dim', default=64)  # hidden_layer_dim more than batch_size * walk_num * walk_len
+parser.add_argument('--g_clip', default=5)  # from DPGGAN
 parser.add_argument('--w_clip', default=1/8)
 
-args = parser.parse_args()
+args = parser.parse_args()  # parameters
+# ---------------------------------------------------
 
 class DiGraSynModel:
     def __init__(self, graph, Layer_num, node_embed_init=None):
@@ -87,6 +94,8 @@ class DiGraSynModel:
             self.node_tail_embedding = tf.matmul(tf.one_hot(self.node_tail_ids, depth=args.num_of_gra),
                                                  self.node_embedding_matrix)  # done
 
+            # self.noise_embedding = tf.placeholder(tf.float32, shape=[None, args.embedding_dim])  # done
+
             self.head_node_score = self.generate_node(self.node_head_embedding, Layer_num)
             self.head_node_score = tf.transpose(self.head_node_score)
 
@@ -120,34 +129,43 @@ class DiGraSynModel:
                 for i, (g, v) in enumerate(self.grads_and_vars):  # for each pair
                     if g is not None and v is not None:
                         if "node_embedding_mat" in v.name:
+                            # g = tf.clip_by_norm(g, 0.5)  # Clips tensor values to a maximum L2-norm
                             noise_g = g + self.Gau_Noise(g, args.g_clip)
-                            self.grads_and_vars[i] = (noise_g, v)
+                            self.grads_and_vars[i] = (noise_g, v)  # clip gradients
                         else:
                             self.grads_and_vars[i] = (g, v)
 
-                self.train_op = self.optimizer.apply_gradients(self.grads_and_vars)
+                self.train_op = self.optimizer.apply_gradients(self.grads_and_vars)  # should assign to a new optimizer
 
     def generate_node(self, node_embedding, Layer_num):
         global layer_result
         input = tf.reshape(node_embedding, [-1, args.embedding_dim])
         for l in range(Layer_num):
             self.biase = self.biases[l]
+            # self.weight = tf.clip_by_norm(self.weights[l], args.w_clip)  # weight clipping
             self.weight = spectral_norm(self.weights[l]) * args.w_clip
+            # self.weight = l2_norm(self.weights[l])
             layer_result = tf.nn.sigmoid(tf.add(tf.matmul(input, self.weight), self.biase))
             input = layer_result
         output = layer_result
         return output
 
     def Gau_Noise(self, tensor, sens_value):
-        sigma = tf.sqrt(2 * tf.log(1.25 / args.delta)) / args.epsilon
+        total_iters = args.n_epochs * math.floor(self.n_node / args.batch_size)
+        # split privacy parameters delta and epsilon
+        sigma = tf.sqrt(2 * tf.log(1.25 / (args.delta / total_iters))) / (args.epsilon / total_iters)
         s = tensor.get_shape().as_list()  # get shape of the tensor
         Gau_noise = tf.random_normal(s, mean=0.0, stddev=sigma * sens_value)
+        # t = tf.add(tensor, rt)
         return Gau_noise
 
     def random_walk(self, s, graph):
         walk = []
         p = s
         while len(walk) < args.walk_len:
+            # DiGraph.neighbors(n)
+            # Returns an iterator over successor nodes of n
+            # A successor of n is a node m such that there exists a directed edge from n to m.
             if p not in graph.nodes() or len(graph.neighbors(p)) == 0:
                 break
             p = random.choice(graph.neighbors(p))
@@ -175,14 +193,17 @@ class DiGraSynModel:
 
         return node_head_ids, node_tail_ids, node_head_outDeg, node_tail_inDeg
 
-    def train(self, graph):
+    def train(self, graph, run_time):
         self.node_list = graph.nodes()
         node_count_mat = np.zeros((graph.number_of_nodes(), graph.number_of_nodes()))
         with tf.Session() as sess:
-            sess.run(tf.global_variables_initializer())
+            sess.run(tf.global_variables_initializer())  # note that this initilization's location
+            # for each_epoch in range(args.n_epochs):
             for each_epoch in range(args.n_epochs):
+                # if epoch > 0 and epoch % args.eval_every == 0:
+                # for d_epoch in range(args.d_epoch):
                 for index in range(math.floor(len(self.node_list) / args.batch_size)):
-                    print('epoch: %d, index: %d' % (each_epoch, index))
+                    print('run_time: %d, epoch: %d, index: %d' % (run_time, each_epoch, index))
                     head_ids, tail_ids, head_outDeg, tail_inDeg = self.random_walk_sampling(index, self.node_list, graph)
                     # noise_embedding = np.random.normal(0.0, 1, (len(head_ids), args.embedding_dim))
                     if len(head_ids) is not 0 or len(tail_ids) is not 0:
@@ -202,9 +223,13 @@ class DiGraSynModel:
 
 def generate_SynGraphs(SynDigraName, num_of_edge, node_count_mat):
     sparse_node_count_mat = sp.csr_matrix(node_count_mat)
+    # sp.save_npz('PrivSynP2P.npz', sparse_node_count_mat)
+    # num_of_edges = graph.number_of_edges()
     syn_graph_adj = graph_from_scores(sparse_node_count_mat, num_of_edge)
     di_graph = transform_adj_to_DiGraph(syn_graph_adj)
+    # file_name = 'FN_SynWiki_nepoch50.txt'
     saveGraphToEdgeListTxtn2v(di_graph, SynDigraName)
+    # print('Performing is end')
 
 def l2_norm(v):
     return v / (tf.reduce_sum(v ** 2) ** 0.5)
@@ -264,6 +289,7 @@ def graph_from_scores(scores, n_edges):
     target_g = np.zeros(scores.shape)  # initialize target graph
     scores_int = scores.toarray().copy()  # internal copy of the scores matrix
     scores_int[np.diag_indices_from(scores_int)] = 0  # set diagonal to zero
+    # degrees_int = scores_int.sum(0)   # The row sum over the scores.
 
     diff = np.round((n_edges - target_g.sum())/2)
     if diff > 0:
@@ -305,28 +331,68 @@ def gumbel_softmax_sample(logits, temperature):
     return tf.nn.softmax(y / temperature)
 
 if __name__ == '__main__':
-    # 'cora', 'citeseer', 'p2p', 'chicago'
-    dataset_name = 'cora'
+    dataset_names = ['cora', 'citeseer', 'p2p', 'chicago']
+    # dataset_names = ['chicago', 'wiki', 'jung']
+    Alg_name = 'PrivDPR_VaryEpsilon'
+    w_clip_values = [1/8]
+    run_times = 5
+    epsilon_values = [0.1, 0.2, 0.4, 0.8, 1.6]
+    # save_run_time_1 = []
+    # save_run_time_2 = []
 
-    Alg_name = 'SynGra_' + dataset_name
-    Pre_name = 'Processed_'
-    train_filename = '../ProcessedData/' + Pre_name + dataset_name + '.txt'
-    # Load graph
-    OriGraph = graph_util.loadGraphFromEdgeListTxt(train_filename, directed=False)
-    OriGraph = OriGraph.to_directed()
-    num_of_edge = OriGraph.number_of_edges()
-    num_of_node = OriGraph.number_of_nodes()
-    M = (2 * (num_of_node - 1) * args.delay_factor ** 2 + 2 * args.delay_factor \
-         + 2 * args.delay_factor * (1 - args.delay_factor) / num_of_node) * (1 + 1 / args.delay_factor)
-    each_batch = args.batch_size * args.walk_num * args.walk_len
-    size = math.floor(num_of_node / args.batch_size)
-    x = args.g_clip / (M * size)
-    base = args.w_clip
-    Layer_num = math.ceil(math.log(x, base) - 1)
-    print(Layer_num)
+    for run_time in range(run_times):
+        for each_w_clip in w_clip_values:
+            args.w_clip = each_w_clip
+            # epsilon_values = [0.1, 0.2, 0.4, 0.8, 1.6, 3.2]
+            for epsilon in epsilon_values:
+                for dataset_name in dataset_names:
+                    args.epsilon = epsilon
+                    Pre_name = 'Processed_'
+                    # dataset_name = 'cora'  # cora p2p-Gnutella08 Wiki-Vote google
+                    # train_filename = '../PreProcessData/' + dataset_name
+                    train_filename = '../ProcessedData/' + Pre_name + dataset_name + '.txt'
+                    # isDirected = False
+                    # Load graph
+                    OriGraph = graph_util.loadGraphFromEdgeListTxt(train_filename, directed=False)
+                    # num_of_edge = OriGraph.number_of_edges()
+                    # num_of_node = OriGraph.number_of_nodes()
+                    OriGraph = OriGraph.to_directed()
+                    num_of_edge = OriGraph.number_of_edges()
+                    num_of_node = OriGraph.number_of_nodes()
+                    # batch_num = math.floor(OriGraph.number_of_nodes() / args.batch_size)
+                    M = (2 * (num_of_node - 1) * args.delay_factor ** 2 + 2 * args.delay_factor \
+                         + 2 * args.delay_factor * (1 - args.delay_factor) / num_of_node) * (1 + 1 / args.delay_factor)
+                    num_of_sampledNodePairs = args.batch_size * args.walk_num * args.walk_len
+                    iterNum_in_each_epoch = math.floor(num_of_node / args.batch_size)
+                    x = args.g_clip / (num_of_sampledNodePairs * M * args.n_epochs * iterNum_in_each_epoch)
+                    base = args.w_clip
+                    Layer_num = math.ceil(math.log(x, base) - 1)
+                    print(Layer_num)
+                    # args.layer_num = Layer_num
 
-    model = DiGraSynModel(OriGraph, Layer_num)
-    node_count_mat = model.train(OriGraph)
-    generate_SynGraphs(Alg_name, num_of_edge, node_count_mat)
-    print('performing is end')
+                    mark_time = str(time.time()).split(".")[0]
+                    name_para = '_Syn' + dataset_name + \
+                                '_batch' + str(args.batch_size) + \
+                                '_wNum' + str(args.walk_num) + \
+                                '_wLen' + str(args.walk_len) + \
+                                '_epochs' + str(args.n_epochs) + \
+                                '_eps' + str(epsilon) + \
+                                '_g_c' + str(args.g_clip) + \
+                                '_w_c' + str(args.w_clip) + \
+                                '_step' + str(args.learning_rate) + \
+                                '_layerDim' + str(args.hidden_layer_dim) + \
+                                '_layerNum' + str(Layer_num) + \
+                                '_' + mark_time + '.txt'
 
+                    SynDigraName = Alg_name + name_para
+                    start_time = time.time()
+                    model = DiGraSynModel(OriGraph, Layer_num)
+                    node_count_mat = model.train(OriGraph, run_time)
+                    end_time_1 = time.time()
+                    generate_SynGraphs(SynDigraName, num_of_edge, node_count_mat)
+                    end_time_2 = time.time()
+                    # save_run_time_1.append(end_time_1 - start_time)
+                    # save_run_time_2.append(end_time_2 - start_time)
+                    # print('success')
+                    tf.reset_default_graph()
+                    print('performing is end')
