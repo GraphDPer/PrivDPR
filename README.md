@@ -1,2 +1,4 @@
 ## Requirements
-- tensorflow
+- python 3
+- Tensorflow
+- numpy
