@@ -251,7 +251,7 @@ def spectral_norm(w, iteration=1):
 
 def transform_adj_to_DiGraph(adj):
     n = adj.shape[0]
-    di_graph = nx.DiGraph()
+    di_graph = nx.Graph()
     di_graph.add_nodes_from(range(n))
     for i in range(n):
         for j in range(n):
@@ -272,26 +272,52 @@ def saveGraphToEdgeListTxtn2v(graph, file_name):
         for i, j, w in graph.edges(data='weight', default=1):
             f.write('%d %d %f\n' % (i, j, w))
 
-def graph_from_scores(scores, n_edges):
+def graph_from_scores(scores, n_edges=None):
     target_g = np.zeros(scores.shape)  # initialize target graph
+    scores = scores + scores.T
     scores_int = scores.toarray().copy()  # internal copy of the scores matrix
     scores_int[np.diag_indices_from(scores_int)] = 0  # set diagonal to zero
-    # degrees_int = scores_int.sum(0)   # The row sum over the scores.
+    degrees_int = scores_int.sum(1)   # The row sum over the scores.
 
-    diff = np.round((n_edges - target_g.sum())/2)
+    N = target_g.shape[0]
+    for n in range(N):  # Iterate over the nodes
+        target = np.random.choice(N, p=scores_int[n] / degrees_int[n])
+        target_g[n, target] = 1
+        target_g[target, n] = 1
+
+    n_edges = 6000
+    '''
+    Here n_edges is determined by applying the Sigmoid function 
+    with a threshold value of 0.5 to private embeddings
+    '''
+    diff = np.round((2 * n_edges - target_g.sum()) / 2)
     if diff > 0:
         triu = np.triu(scores_int)
-        triu[target_g > 0] = 0
-        triu[np.diag_indices_from(scores_int)] = 0
+        triu[target_g.nonzero()] = 0
         triu = triu / triu.sum()
 
+        n_possible = np.count_nonzero(triu)
+
         triu_ixs = np.triu_indices_from(scores_int)
-        extra_edges = np.random.choice(triu_ixs[0].shape[0], replace=False, p=triu[triu_ixs], size=int(diff))
+        extra_edges = np.random.choice(
+            triu_ixs[0].shape[0], replace=False, p=triu[triu_ixs], size=min(int(diff), int(n_possible))
+        )
 
         target_g[(triu_ixs[0][extra_edges], triu_ixs[1][extra_edges])] = 1
         target_g[(triu_ixs[1][extra_edges], triu_ixs[0][extra_edges])] = 1
 
-    target_g = symmetric(target_g)
+        # triu = np.triu(scores_int)
+        # triu[target_g > 0] = 0
+        # triu[np.diag_indices_from(scores_int)] = 0
+        # triu = triu / triu.sum()
+        #
+        # triu_ixs = np.triu_indices_from(scores_int)
+        # extra_edges = np.random.choice(triu_ixs[0].shape[0], replace=False, p=triu[triu_ixs], size=int(diff))
+        #
+        # target_g[(triu_ixs[0][extra_edges], triu_ixs[1][extra_edges])] = 1
+        # target_g[(triu_ixs[1][extra_edges], triu_ixs[0][extra_edges])] = 1
+
+    # target_g = symmetric(target_g)
 
     return target_g
 
@@ -318,11 +344,11 @@ def gumbel_softmax_sample(logits, temperature):
     return tf.nn.softmax(y / temperature)
 
 if __name__ == '__main__':
-    dataset_names = ['cora', 'citeseer', 'p2p', 'chicago']
+    dataset_names = ['cora']
     Alg_name = 'PrivDPR_VaryEpsilon'
     w_clip_values = [1/8]
     run_times = 5
-    epsilon_values = [0.1, 0.2, 0.4, 0.8, 1.6]
+    epsilon_values = [0.1]
 
     for run_time in range(run_times):
         for each_w_clip in w_clip_values:
@@ -333,8 +359,8 @@ if __name__ == '__main__':
                     Pre_name = 'Processed_'
                     train_filename = '../ProcessedData/' + Pre_name + dataset_name + '.txt'
                     # Load graph
-                    OriGraph = graph_util.loadGraphFromEdgeListTxt(train_filename, directed=False)
-                    OriGraph = OriGraph.to_directed()
+                    OriGraph = graph_util.loadGraphFromEdgeListTxt(train_filename, directed=True)
+                    # OriGraph = OriGraph.to_directed()
                     num_of_edge = OriGraph.number_of_edges()
                     num_of_node = OriGraph.number_of_nodes()
                     M = (2 * (num_of_node - 1) * args.delay_factor ** 2 + 2 * args.delay_factor \
